@@ -21,7 +21,7 @@ Usage example:
       --iou 0.5 \
       --max-save 20 \
       --out-dir out_frames \
-      --poor-threshold 0.50
+      --poor-threshold 0.50 for binary decision
 """
 
 import os
@@ -87,22 +87,23 @@ def face_detect_ratio_yolov8(video_path: Path, sample_rate: int, model, conf: fl
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv_path", type=str, help="Input CSV with columns: Video Name, Label")
-    parser.add_argument("--base", type=str, default="/mnt/sunlab-nas-1/CVAT",
-                        help="Base directory to prefix to 'Video Name'")
+    # parser.add_argument("--base", type=str, default=None,
+    #                     help="Base directory to prefix to 'Video Name'")
     parser.add_argument("--weights", type=str, required=True, help="YOLOv8-face weights path (.pt)")
     parser.add_argument("--sample-rate", type=int, default=10, help="Detect every N frames")
     parser.add_argument("--conf", type=float, default=0.5, help="YOLO confidence threshold")
     parser.add_argument("--iou", type=float, default=0.5, help="YOLO IoU threshold")
     parser.add_argument("--max-save", type=int, default=20, help="Max annotated frames to save per video")
     parser.add_argument("--out-dir", type=str, default="out_frames", help="Root folder to save annotated frames")
-    parser.add_argument("--poor-threshold", type=float, default=0.50,
-                        help="Decision threshold on face detect ratio")
+    parser.add_argument("--t1", type=float, default=0.35, help="Lower FaceDetectRatio threshold for auto poor")
+    parser.add_argument("--t2", type=float, default=0.55, help="Upper FaceDetectRatio threshold for auto not_poor")
+
     parser.add_argument("--output-csv", type=str, default=None,
                         help="Output CSV path (defaults to <input>_with_face_yolo.csv)")
     args = parser.parse_args()
 
     in_csv = Path(args.csv_path)
-    base_dir = Path(args.base)
+    # base_dir = Path(args.base)
     out_csv = Path(args.output_csv) if args.output_csv else in_csv.with_name(in_csv.stem + "_with_face_yolo.csv")
     out_root = Path(args.out_dir)
     ensure_dir(out_root)
@@ -112,14 +113,14 @@ def main():
 
     # Read input CSV
     df = pd.read_csv(in_csv)
-    if not {"Video Name", "Label"}.issubset(df.columns):
-        raise ValueError("Input CSV must have columns: 'Video Name', 'Label'")
+    if not {"video_path", "pred_label"}.issubset(df.columns):
+        raise ValueError("Input CSV must have columns: 'video_path', 'pred_label'")
 
     face_ratios, decisions = [], []
 
     for i, row in df.iterrows():
-        rel_path = row["Video Name"]
-        full_path = base_dir / rel_path
+        rel_path = row["video_path"]
+        full_path = rel_path
 
         safe_stem = Path(rel_path).stem
         video_out_dir = out_root / safe_stem
@@ -132,13 +133,19 @@ def main():
                                          iou=args.iou,
                                          save_dir=video_out_dir,
                                          max_save=args.max_save)
-        decision = "poor" if ratio < args.poor_threshold else "not_poor"
+        if ratio < args.t1:
+            decision = "poor"
+        elif ratio >= args.t2:
+            decision = "not_poor"
+        else:
+            decision = "borderline"
+
         print(f"[{i+1}/{len(df)}] {rel_path} -> ratio={ratio:.3f} decision={decision}")
         face_ratios.append(ratio)
         decisions.append(decision)
 
     # Insert after 'Label'
-    insert_pos = list(df.columns).index("Label") + 1
+    insert_pos = list(df.columns).index("pred_label") + 1
     df.insert(insert_pos, "FaceDetectRatio", face_ratios)
     df.insert(insert_pos + 1, "Decision", decisions)
 
