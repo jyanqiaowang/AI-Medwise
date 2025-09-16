@@ -1,129 +1,213 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+compare_two_excel.py
 
-import argparse
-from pathlib import Path
+Usage:
+    python compare_two_excel.py /path/to/illumination.xlsx /path/to/face.csv -o ./output
+
+Outputs (in output dir):
+ - match.csv
+ - mismatch.csv
+ - summary.json
+ - summary.txt
+"""
 import pandas as pd
-import re
+import os
+import sys
+import argparse
+import json
 
-def canon(s: str) -> str:
-    """标准化列名：小写 + 非字母数字归一为空格 + 去首尾"""
-    return re.sub(r'[^0-9a-z]+', ' ', str(s).lower()).strip()
-
-def load_table(path, sheet=None):
-    path = Path(path)
-    if path.suffix.lower() in [".xls", ".xlsx"]:
-        return pd.read_excel(path, sheet_name=(sheet if sheet else 0))
-    return pd.read_csv(path)
-
-def normalize_numeric_label(x) -> str:
-    """把0/1/2归到not_poor，3归到poor，其它直接返回字符串"""
-    try:
-        v = int(x)
-        return "poor" if v == 3 else "not_poor"
-    except:
-        # 如果是字符串
-        s = str(x).lower().strip()
-        if s in {"3", "poor", "poor quality"}:
-            return "poor"
-        if s in {"0", "1", "2", "not poor", "not poor quality"}:
-            return "not_poor"
-        if s == "borderline":
-            return "borderline"
-        return s
-
-def main():
-    ap = argparse.ArgumentParser(description="Compare two CSV/Excel files with numeric labels 0-3 (3=poor, 0/1/2=not_poor).")
-    ap.add_argument("--file-a", required=True)
-    ap.add_argument("--file-b", required=True)
-    ap.add_argument("--key-col", default="video_path")
-    ap.add_argument("--decision-col", default="Decision")
-    ap.add_argument("--label-col", default="label")  # 或 pred_label
-    ap.add_argument("--out-dir", default="compare_numeric_out")
-    args = ap.parse_args()
-
-    dfA = load_table(args.file_a)
-    dfB = load_table(args.file_b)
-
-    # 统一列名匹配
-    colsA = {canon(c): c for c in dfA.columns}
-    colsB = {canon(c): c for c in dfB.columns}
-    def colA(name): return colsA.get(canon(name), name)
-    def colB(name): return colsB.get(canon(name), name)
-
-    # 检查必要列
-    if canon(args.key_col) not in colsA or canon(args.key_col) not in colsB:
-        raise ValueError("Key column not found in both files.")
-    if canon(args.decision_col) not in colsA or canon(args.decision_col) not in colsB:
-        raise ValueError("Decision column not found in both files.")
-
-    labelA = colsA.get(canon(args.label_col), None)
-    labelB = colsB.get(canon(args.label_col), None)
-
-    needA = [colA(args.key_col), colA(args.decision_col)]
-    needB = [colB(args.key_col), colB(args.decision_col)]
-    if labelA: needA.append(labelA)
-    if labelB: needB.append(labelB)
-
-    A = dfA[needA].copy()
-    B = dfB[needB].copy()
-
-    # 合并
-    merged = A.merge(
-        B,
-        left_on=colA(args.key_col),
-        right_on=colB(args.key_col),
-        how="inner",
-        suffixes=("_a", "_b")
-    )
-    if merged.empty:
-        raise SystemExit("No common rows between the two files.")
-
-    # 统一video_path列
-    key_candidates = [f"{colA(args.key_col)}_a", f"{colB(args.key_col)}_b",
-                      colA(args.key_col), colB(args.key_col)]
-    key_found = next((c for c in key_candidates if c in merged.columns), None)
-    if key_found is None:
-        raise ValueError("Key column not found after merge.")
-    merged["video_path"] = merged[key_found]
-    for c in key_candidates:
-        if c in merged.columns and c != "video_path":
-            merged.drop(columns=[c], inplace=True)
-
-    # 归一化 decision 和 label
-    merged["decision_a"] = merged[f"{colA(args.decision_col)}_a"].map(normalize_numeric_label)
-    merged["decision_b"] = merged[f"{colB(args.decision_col)}_b"].map(normalize_numeric_label)
-
-    if labelA and f"{labelA}_a" in merged.columns:
-        merged["label_a"] = merged[f"{labelA}_a"].map(normalize_numeric_label)
-    if labelB and f"{labelB}_b" in merged.columns:
-        merged["label_b"] = merged[f"{labelB}_b"].map(normalize_numeric_label)
-
-    # 选择参考label
-    label_col = "label_a" if "label_a" in merged.columns else ("label_b" if "label_b" in merged.columns else None)
-
-    # 计算
-    merged["decision_equal"] = merged["decision_a"] == merged["decision_b"]
-    merged["has_borderline"] = merged["decision_a"].eq("borderline") | merged["decision_b"].eq("borderline")
-
-    if label_col:
-        p_a_match = (merged["decision_a"] == merged[label_col]).mean()
-        p_b_match = (merged["decision_b"] == merged[label_col]).mean()
+def load_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        # try utf-8 first, fallback to latin1 if decoding error
+        try:
+            return pd.read_csv(path)
+        except Exception as e:
+            try:
+                return pd.read_csv(path, encoding="latin1")
+            except Exception as e2:
+                raise RuntimeError(f"Failed to read CSV {path}: {e2}") from e2
+    elif ext in [".xls", ".xlsx"]:
+        try:
+            return pd.read_excel(path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Excel {path}: {e}")
     else:
-        p_a_match = p_b_match = None
+        raise ValueError(f"Unsupported file format: {ext} (path={path})")
 
-    # 输出
-    outdir = Path(args.out_dir); outdir.mkdir(parents=True, exist_ok=True)
-    merged[merged["decision_equal"]].to_csv(outdir / "matches.csv", index=False)
-    merged[~merged["decision_equal"]].to_csv(outdir / "mismatches.csv", index=False)
+def normalize_columns(df):
+    # Convert all column names to lowercase (for easier matching), keep spaces/underscores
+    lower_map = {c: c.lower().strip() for c in df.columns}
+    df = df.rename(columns=lower_map)
 
-    print(f"Total common: {len(merged)}")
-    print(f"Matches: {merged['decision_equal'].sum()} ({merged['decision_equal'].mean()*100:.2f}%)")
-    print(f"Borderline prevalence (either is 'borderline'): {merged['has_borderline'].mean()*100:.2f}%")
-    if label_col:
-        print(f"Decision_a vs label match rate: {p_a_match*100:.2f}%")
-        print(f"Decision_b vs label match rate: {p_b_match*100:.2f}%")
-    print(f"Results saved to: {outdir}")
+    # Candidate names for video_path
+    vp_candidates = ["video name", "video_name", "video_path", "video"]
+    found = False
+    for cand in vp_candidates:
+        if cand in df.columns:
+            df = df.rename(columns={cand: "video_path"})
+            found = True
+            break
+    if not found:
+        raise ValueError("Missing video path column. Expected one of: " + ", ".join(vp_candidates))
+
+    # Candidate names for label
+    label_candidates = ["label", "pred_label", "pred label", "prediction"]
+    found = False
+    for cand in label_candidates:
+        if cand in df.columns:
+            df = df.rename(columns={cand: "pred_label"})
+            found = True
+            break
+    if not found:
+        raise ValueError("Missing label/pred_label column. Expected one of: " + ", ".join(label_candidates))
+
+    # Decision column (case-insensitive)
+    if "decision" not in df.columns:
+        raise ValueError("Missing decision column (Decision/decision).")
+    # Normalize decision text
+    df["decision"] = df["decision"].astype(str).str.strip().str.lower()
+    df["decision"] = df["decision"].replace({
+        "poor quality": "poor",
+        "not poor quality": "not poor",
+        "not poor": "not poor",
+        "poor": "poor",
+        "borderline": "borderline"
+    })
+
+    # Find columns containing "ratio"
+    ratio_cols = [c for c in df.columns if "ratio" in c]
+    if len(ratio_cols) == 0:
+        raise ValueError(f"No ratio column found in columns: {list(df.columns)}")
+    if len(ratio_cols) > 1:
+        # Not fatal, but warn user
+        print("Warning: multiple ratio-like columns found, using the first one:", ratio_cols)
+    df = df.rename(columns={ratio_cols[0]: "ratio"})
+
+    # Clean up whitespace in video_path and pred_label
+    df["video_path"] = df["video_path"].astype(str).str.strip()
+    df["pred_label"] = df["pred_label"].astype(str).str.strip()
+
+    return df
+
+def process_csv(illumination_path, face_path, output_dir="./output"):
+    # Read files
+    df_illum = load_file(illumination_path)
+    df_face = load_file(face_path)
+
+    # Normalize column names
+    df_illum = normalize_columns(df_illum)
+    df_face = normalize_columns(df_face)
+
+    # Rename decision/ratio to more meaningful column names
+    df_illum = df_illum.rename(columns={"decision": "decision_illumination", "ratio": "underlit_ratio"})
+    df_face = df_face.rename(columns={"decision": "decision_face", "ratio": "face_ratio"})
+
+    # Keep only necessary columns (ignore others if present)
+    need_illum_cols = ["video_path", "pred_label", "decision_illumination", "underlit_ratio"]
+    need_face_cols = ["video_path", "pred_label", "decision_face", "face_ratio"]
+    for c in need_illum_cols:
+        if c not in df_illum.columns:
+            raise ValueError(f"Expected column '{c}' in illumination file but not found.")
+    for c in need_face_cols:
+        if c not in df_face.columns:
+            raise ValueError(f"Expected column '{c}' in face file but not found.")
+
+    left = df_illum[need_illum_cols]
+    right = df_face[need_face_cols]
+
+    # Inner join: only compare rows that exist in both files (video_path + pred_label)
+    merged = pd.merge(left, right, on=["video_path", "pred_label"], how="inner")
+
+    total = len(merged)
+    match_df = merged[merged["decision_illumination"] == merged["decision_face"]]
+    mismatch_df = merged[merged["decision_illumination"] != merged["decision_face"]]
+
+    match_count = len(match_df)
+    mismatch_count = len(mismatch_df)
+    match_ratio = match_count / total if total > 0 else 0.0
+
+    # Borderline statistics
+    border_any_mask = (merged["decision_illumination"] == "borderline") | (merged["decision_face"] == "borderline")
+    border_any_count = int(border_any_mask.sum())
+    border_any_ratio = border_any_count / total if total > 0 else 0.0
+
+    border_both_mask = (merged["decision_illumination"] == "borderline") & (merged["decision_face"] == "borderline")
+    border_both_count = int(border_both_mask.sum())
+    border_both_ratio = border_both_count / total if total > 0 else 0.0
+
+    border_illum_count = int((merged["decision_illumination"] == "borderline").sum())
+    border_face_count = int((merged["decision_face"] == "borderline").sum())
+    border_illum_ratio = border_illum_count / total if total > 0 else 0.0
+    border_face_ratio = border_face_count / total if total > 0 else 0.0
+
+    # Distribution of decisions on each side
+    dist_illum = merged["decision_illumination"].value_counts().to_dict()
+    dist_face = merged["decision_face"].value_counts().to_dict()
+
+    # Save match / mismatch csv (keep a fixed column order)
+    os.makedirs(output_dir, exist_ok=True)
+    out_cols = ["video_path", "decision_illumination", "decision_face", "pred_label", "underlit_ratio", "face_ratio"]
+    # Fill missing columns with empty strings to ensure output consistency
+    for c in out_cols:
+        if c not in merged.columns:
+            merged[c] = ""
+
+    match_df[out_cols].to_csv(os.path.join(output_dir, "match.csv"), index=False)
+    mismatch_df[out_cols].to_csv(os.path.join(output_dir, "mismatch.csv"), index=False)
+
+    # Save summary
+    summary = {
+        "total_merged": int(total),
+        "match_count": int(match_count),
+        "mismatch_count": int(mismatch_count),
+        "match_ratio": float(match_ratio),
+        "borderline_any_count": int(border_any_count),
+        "borderline_any_ratio": float(border_any_ratio),
+        "borderline_both_count": int(border_both_count),
+        "borderline_both_ratio": float(border_both_ratio),
+        "borderline_illum_count": int(border_illum_count),
+        "borderline_illum_ratio": float(border_illum_ratio),
+        "borderline_face_count": int(border_face_count),
+        "borderline_face_ratio": float(border_face_ratio),
+        "decision_distribution_illumination": dist_illum,
+        "decision_distribution_face": dist_face
+    }
+
+    with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    # Human-readable summary
+    with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write("Summary\n")
+        f.write("=======\n")
+        f.write(f"Total merged rows: {total}\n")
+        f.write(f"Match count: {match_count}  (match_ratio = {match_ratio:.4f})\n")
+        f.write(f"Mismatch count: {mismatch_count}\n")
+        f.write("\n")
+        f.write("Borderline stats (rows where either/both sides show 'borderline'):\n")
+        f.write(f"  Any borderline count: {border_any_count}  (ratio = {border_any_ratio:.4f})\n")
+        f.write(f"  Both borderline count: {border_both_count}  (ratio = {border_both_ratio:.4f})\n")
+        f.write(f"  Illumination borderline count: {border_illum_count}  (ratio = {border_illum_ratio:.4f})\n")
+        f.write(f"  Face borderline count: {border_face_count}  (ratio = {border_face_ratio:.4f})\n")
+        f.write("\n")
+        f.write("Decision distributions (illumination):\n")
+        f.write(json.dumps(dist_illum, ensure_ascii=False, indent=2))
+        f.write("\nDecision distributions (face):\n")
+        f.write(json.dumps(dist_face, ensure_ascii=False, indent=2))
+        f.write("\n")
+
+    # Print summary to terminal
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(f"\nSaved: match.csv, mismatch.csv, summary.json, summary.txt in {output_dir}")
+
+    return summary
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Compare illumination and face CSV/XLSX and output match/mismatch plus stats.")
+    parser.add_argument("illumination", help="illumination file (.csv/.xlsx) (should contain keyword 'ratio' in one column)")
+    parser.add_argument("face", help="face file (.csv/.xlsx) (should contain keyword 'ratio' in one column)")
+    parser.add_argument("-o", "--output_dir", default="./output", help="output directory")
+    args = parser.parse_args()
+    process_csv(args.illumination, args.face, args.output_dir)
