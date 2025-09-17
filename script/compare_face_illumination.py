@@ -94,7 +94,9 @@ def normalize_columns(df):
 
 
 def map_pred_label(label) -> str:
-    # 统一转字符串处理
+    # Map pred_label to "not poor quality", "poor quality", or "borderline"
+    # 0,1,2 -> "not poor quality"
+    # 3 -> "poor quality"
     s = str(label).strip()
     if s in {"0", "1", "2"}:
         return "not poor quality"
